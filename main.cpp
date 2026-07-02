@@ -26,12 +26,23 @@
 
 // --- ANSI escape codes: control the terminal cursor/colors as plain text ---
 static const char* CLEAR_SCREEN = "\033[2J\033[H"; // clear + cursor to top-left
+static const char* HOME         = "\033[H";        // move cursor to top-left ONLY
+static const char* CLR_EOL      = "\033[K";        // erase from cursor to line end
+static const char* CLR_BELOW    = "\033[J";        // erase everything below cursor
+static const char* HIDE_CURSOR  = "\033[?25l";     // hide the blinking cursor
+static const char* SHOW_CURSOR  = "\033[?25h";     // show it again
 static const char* BOLD         = "\033[1m";
 static const char* RESET        = "\033[0m";
 static const char* CYAN         = "\033[36m";
 static const char* GREEN        = "\033[32m";
 static const char* YELLOW       = "\033[33m";
 static const char* RED          = "\033[31m";
+
+// We end every printed line with this instead of a plain "\n". CLR_EOL wipes
+// any leftover characters from the PREVIOUS frame that were longer than the
+// current line — this is what lets us overwrite in place without clearing the
+// whole screen (which causes the flicker / scrolling you saw).
+static const char* EOL = "\033[K\n";
 
 // Pick a color by load level: green < 50%, yellow < 80%, red otherwise.
 // Returns an ANSI color code so bars visually signal how busy something is.
@@ -112,87 +123,103 @@ static std::string humanKB(long kb) {
     return os.str();
 }
 
-// Draw one refresh of the whole screen.
+// Draw one refresh IN PLACE.
+// Instead of clearing the whole screen (which flickers and scrolls), we move
+// the cursor to the top-left with HOME and overwrite the old text line by line.
+// Every line ends with EOL ("\033[K\n") to erase leftovers from the last frame,
+// and we finish with CLR_BELOW to wipe any lines the new frame didn't cover.
 // `history` holds recent overall-CPU% values so we can draw a trend graph.
 static void draw(const SystemMonitor& mon, const std::deque<double>& history) {
-    std::cout << CLEAR_SCREEN;
-    std::cout << BOLD << CYAN
-              << "=== Linux System Monitor (C++) ===" << RESET << "\n\n";
+    std::ostringstream out;                 // build the whole frame, print once
+    out << HOME;
+    out << BOLD << CYAN
+        << "=== Linux System Monitor (C++) ===" << RESET << EOL << EOL;
 
-    std::cout << std::fixed << std::setprecision(1);
+    out << std::fixed << std::setprecision(1);
 
     // --- CPU with a bar graph ---
     double cpu = mon.getCpuPercent();
-    std::cout << BOLD << "CPU  " << RESET
-              << makeBar(cpu, 30) << "  " << cpu << "%\n";
+    out << BOLD << "CPU  " << RESET << makeBar(cpu, 30) << "  " << cpu << "%" << EOL;
 
     // --- RAM with a bar graph ---
     double memPct = mon.getTotalMemKB()
                   ? 100.0 * mon.getUsedMemKB() / mon.getTotalMemKB() : 0.0;
-    std::cout << BOLD << "RAM  " << RESET
-              << makeBar(memPct, 30) << "  "
-              << humanKB(mon.getUsedMemKB()) << " / "
-              << humanKB(mon.getTotalMemKB()) << "\n";
+    out << BOLD << "RAM  " << RESET << makeBar(memPct, 30) << "  "
+        << humanKB(mon.getUsedMemKB()) << " / "
+        << humanKB(mon.getTotalMemKB()) << EOL;
 
     // --- Swap with a bar graph (only if swap exists) ---
     if (mon.getTotalSwapKB() > 0) {
         double swapPct = 100.0 * mon.getUsedSwapKB() / mon.getTotalSwapKB();
-        std::cout << BOLD << "Swap " << RESET
-                  << makeBar(swapPct, 30) << "  "
-                  << humanKB(mon.getUsedSwapKB()) << " / "
-                  << humanKB(mon.getTotalSwapKB()) << "\n";
+        out << BOLD << "Swap " << RESET << makeBar(swapPct, 30) << "  "
+            << humanKB(mon.getUsedSwapKB()) << " / "
+            << humanKB(mon.getTotalSwapKB()) << EOL;
     }
 
     // --- CPU history as a scrolling sparkline graph ---
-    std::cout << "\n" << BOLD << "CPU history " << RESET << "(last "
-              << history.size() << "s):\n  ";
-    for (double v : history) std::cout << loadColor(v) << spark(v) << RESET;
-    std::cout << "\n";
+    out << EOL << BOLD << "CPU history " << RESET << "(last "
+        << history.size() << "s):" << EOL << "  ";
+    for (double v : history) out << loadColor(v) << spark(v) << RESET;
+    out << EOL;
 
-    // --- Per-core CPU bars ---
-    std::cout << "\n" << BOLD << "Per-core:" << RESET << "\n";
+    // --- Per-core CPU bars, packed several per row to stay compact ---
+    out << EOL << BOLD << "Per-core:" << RESET << EOL;
     const auto& cores = mon.getCorePercents();
+    const int PER_ROW = 4;                  // how many core bars on one line
     for (size_t i = 0; i < cores.size(); ++i) {
-        std::ostringstream label;
-        label << "Core" << i;
-        std::cout << "  " << std::left << std::setw(7) << label.str()
-                  << makeBar(cores[i], 20) << "  " << cores[i] << "%\n";
+        std::ostringstream cell;
+        cell << "C" << std::left << std::setw(2) << i;      // e.g. "C0 "
+        out << "  " << cell.str() << makeBar(cores[i], 8)
+            << std::right << std::setw(6) << cores[i] << "% ";
+        if ((int)((i + 1) % PER_ROW) == 0) out << EOL;      // end of a row
     }
+    if (cores.size() % PER_ROW != 0) out << EOL;            // finish last row
 
-    std::cout << "\n" << BOLD << GREEN
-              << std::left
-              << std::setw(8)  << "PID"
-              << std::setw(22) << "NAME"
-              << std::setw(7)  << "STATE"
-              << std::setw(8)  << "CPU%"
-              << std::setw(6)  << "NICE"
-              << std::setw(10) << "MEM"
-              << RESET << "\n";
+    // --- process table header ---
+    out << EOL << BOLD << GREEN << std::left
+        << std::setw(8)  << "PID"
+        << std::setw(18) << "NAME"
+        << std::setw(7)  << "STATE"
+        << std::setw(8)  << "CPU%"
+        << std::setw(6)  << "NICE"
+        << std::setw(10) << "MEM"
+        << RESET << EOL;
 
     // --- top processes by CPU ---
     const auto& procs = mon.getProcesses();
     int shown = 0;
     for (const auto& p : procs) {
-        if (shown++ >= 15) break;                     // top 15 fit on a screen
+        if (shown++ >= 10) break;           // top 10 keeps the screen compact
 
-        // Format cpu% into a small string so column alignment stays clean.
-        std::ostringstream cpu;
-        cpu << std::fixed << std::setprecision(1) << p.cpuPercent;
+        std::ostringstream cpuStr;
+        cpuStr << std::fixed << std::setprecision(1) << p.cpuPercent;
 
-        std::cout << std::left
-                  << std::setw(8)  << p.pid
-                  << std::setw(22) << p.name.substr(0, 21)
-                  << std::setw(7)  << p.state
-                  << std::setw(8)  << cpu.str()
-                  << std::setw(6)  << p.nice
-                  << std::setw(10) << humanKB(p.memKB)
-                  << "\n";
+        out << std::left
+            << std::setw(8)  << p.pid
+            << std::setw(18) << p.name.substr(0, 17)
+            << std::setw(7)  << p.state
+            << std::setw(8)  << cpuStr.str()
+            << std::setw(6)  << p.nice
+            << std::setw(10) << humanKB(p.memKB)
+            << EOL;
     }
+
+    out << EOL << "[q] quit   [k] kill process" << EOL;
+    out << CLR_BELOW;                        // erase any old lines below the frame
+
+    std::cout << out.str();                  // one write = no flicker
+    std::cout.flush();
 }
 
 int main() {
     SystemMonitor mon;
     enableRawMode();
+
+    // Clear the screen ONCE up front and hide the cursor. From here on every
+    // frame is drawn in place (cursor homed), so the display updates instead of
+    // scrolling. HIDE_CURSOR stops the cursor from flickering across the screen.
+    std::cout << CLEAR_SCREEN << HIDE_CURSOR;
+    std::cout.flush();
 
     // First update establishes the baseline sample; CPU% needs two samples,
     // so we do one silent update, then start the loop.
@@ -210,10 +237,7 @@ int main() {
         cpuHistory.push_back(mon.getCpuPercent());
         if (cpuHistory.size() > HISTORY_LEN) cpuHistory.pop_front();
 
-        draw(mon, cpuHistory);
-
-        std::cout << "\n" << "[q] quit   [k] kill process\n";
-        std::cout.flush();
+        draw(mon, cpuHistory);          // draws in place + its own footer
 
         char key = pollKey();                         // waits up to 1s
         if (key == 'q') {
@@ -222,7 +246,8 @@ int main() {
             // Temporarily go back to normal (cooked) input so the user can
             // type a full PID and press Enter comfortably.
             disableRawMode();
-            std::cout << "\nEnter PID to kill: ";
+            std::cout << CLEAR_SCREEN << SHOW_CURSOR;
+            std::cout << "Enter PID to kill: ";
             std::cout.flush();
             int pid = 0;
             std::cin >> pid;
@@ -235,10 +260,12 @@ int main() {
             std::cin.ignore();
             std::cin.get();
             enableRawMode();
+            std::cout << CLEAR_SCREEN << HIDE_CURSOR;  // back to live view
+            std::cout.flush();
         }
     }
 
     disableRawMode();
-    std::cout << CLEAR_SCREEN << "Goodbye!\n";
+    std::cout << SHOW_CURSOR << CLEAR_SCREEN << "Goodbye!\n";  // restore cursor
     return 0;
 }
