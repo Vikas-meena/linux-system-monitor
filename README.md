@@ -116,7 +116,9 @@ main.cpp           # display loop + keyboard input
 Makefile           # build
 ```
 
-## Possible extensions
-- Per-core CPU bars, network I/O (`/proc/net/dev`), disk I/O
-- Filter/search processes, adjustable refresh rate
-- Port the UI to `ncurses`
+## Roadmap
+Planned features and improvements — grouped by difficulty, each with the OS
+concept it demonstrates and where to implement it — are tracked in
+[ROADMAP.md](ROADMAP.md). Highlights: sort toggle, uptime/load average, process
+state summary, CPU temperature, network throughput, disk usage, and (stretch) a
+loadable kernel module exposing a custom `/proc` entry.
