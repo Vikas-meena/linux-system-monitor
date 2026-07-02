@@ -1,0 +1,9 @@
+# Compiled object files
+*.o
+
+# Built executable
+monitor
+
+# Editor / OS junk
+*.swp
+.DS_Store
