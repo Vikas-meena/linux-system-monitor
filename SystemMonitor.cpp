@@ -12,6 +12,7 @@
 #include <algorithm>   // std::sort
 #include <sys/statvfs.h> // statvfs() -> free/total space of a mount
 #include <sys/resource.h>// setpriority() -> renice a process
+#include <cstdio>        // popen()/pclose() -> run nvidia-smi and read its output
 
 // ===========================================================================
 // Constructor: figure out how many CPU cores we have.
@@ -46,6 +47,7 @@ void SystemMonitor::update() {
     readNetDev();
     readDiskStats();
     readDiskUsage();
+    readGpu();
 }
 
 // ===========================================================================
@@ -528,5 +530,55 @@ void SystemMonitor::readDiskUsage() {
         dm.usedPct    = 100.0 * used / total;
         (void)avail;                    // available space is implied by total-used
         diskMounts_.push_back(dm);
+    }
+}
+
+// ===========================================================================
+// readGpu(): NVIDIA GPU stats via nvidia-smi (Phase 4).
+// ---------------------------------------------------------------------------
+// Unlike CPU/memory there is no universal /proc file for the GPU, so we ask the
+// vendor tool. `nvidia-smi --query-gpu=...` prints exactly the fields we want as
+// one CSV line, which popen() lets us read like a file. If the tool is missing
+// (no NVIDIA GPU / driver), we flip gpuAvailable_ off and stop trying, so the
+// program runs fine on any machine and simply shows no GPU section.
+// ===========================================================================
+void SystemMonitor::readGpu() {
+    if (!gpuAvailable_) return;
+
+    FILE* pipe = popen(
+        "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,"
+        "memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null",
+        "r");
+    if (!pipe) { gpuAvailable_ = false; return; }
+
+    char buf[512] = {0};
+    std::string line;
+    if (std::fgets(buf, sizeof(buf), pipe)) line = buf;
+    int rc = pclose(pipe);
+
+    // Non-zero exit or no output means nvidia-smi isn't usable here.
+    if (rc != 0 || line.empty()) { gpuAvailable_ = false; hasGpu_ = false; return; }
+
+    // Split the CSV line and trim whitespace from each field.
+    std::vector<std::string> f;
+    std::istringstream ss(line);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        std::size_t a = tok.find_first_not_of(" \t\r\n");
+        std::size_t b = tok.find_last_not_of(" \t\r\n");
+        f.push_back(a == std::string::npos ? "" : tok.substr(a, b - a + 1));
+    }
+    if (f.size() < 5) { hasGpu_ = false; return; }
+
+    // Some fields can read "[N/A]" on certain GPUs — guard the conversions.
+    try {
+        gpuName_       = f[0];
+        gpuUtil_       = std::stod(f[1]);
+        gpuMemUsedMB_  = std::stol(f[2]);
+        gpuMemTotalMB_ = std::stol(f[3]);
+        gpuTempC_      = std::stod(f[4]);
+        hasGpu_        = true;
+    } catch (...) {
+        hasGpu_ = false;                // leave gpuAvailable_ true; try again next tick
     }
 }

@@ -150,7 +150,11 @@ it, and a rough **effort**. Check items off as you finish them.
   - *Why:* Qualcomm is ARM-heavy; cross-platform awareness is a plus.
   - *Effort:* 🟡 (mostly setup)
 
-- [ ] **GPU usage** (if NVIDIA: parse `nvidia-smi`; else vendor sysfs).
+- [x] **GPU usage** (if NVIDIA: parse `nvidia-smi`; else vendor sysfs).
+  - *Where:* `SystemMonitor::readGpu` runs `nvidia-smi --query-gpu=...` via
+    `popen` and parses the CSV (load %, memory, temperature). Degrades
+    gracefully (no GPU section) when nvidia-smi is absent. Shown on a "GPU"
+    line in simple view; model + memory bar in detailed view.
   - *Effort:* 🟡
 
 ---

@@ -68,6 +68,14 @@ public:
     bool   hasCpuTemp()   const { return hasCpuTemp_; }
     double getCpuTempC()  const { return cpuTempC_; }
     const std::string& getCpuTempLabel() const { return cpuTempLabel_; }
+
+    // GPU getters (NVIDIA via nvidia-smi; absent on other machines).
+    bool   hasGpu()          const { return hasGpu_; }
+    const std::string& getGpuName() const { return gpuName_; }
+    double getGpuUtil()      const { return gpuUtil_; }
+    long   getGpuMemUsedMB() const { return gpuMemUsedMB_; }
+    long   getGpuMemTotalMB()const { return gpuMemTotalMB_; }
+    double getGpuTempC()     const { return gpuTempC_; }
     const std::vector<NetInterface>& getNetInterfaces() const { return netInterfaces_; }
     double getNetRxKBps() const { return netRxKBps_; }
     double getNetTxKBps() const { return netTxKBps_; }
@@ -92,6 +100,7 @@ private:
     void readNetDev();        // parse /proc/net/dev  -> per-interface throughput
     void readDiskStats();     // parse /proc/diskstats -> aggregate disk I/O rate
     void readDiskUsage();     // parse /proc/mounts + statvfs -> capacity per mount
+    void readGpu();           // run nvidia-smi -> GPU load / memory / temperature
 
     // Elapsed wall-clock time between the last two update() calls. Rate metrics
     // (network, disk I/O) divide their byte/sector delta by this.
@@ -124,6 +133,14 @@ private:
     bool        hasCpuTemp_ = false;
     double      cpuTempC_ = 0.0;
     std::string cpuTempLabel_;
+
+    // --- GPU (NVIDIA via nvidia-smi) ---
+    bool        gpuAvailable_ = true;   // becomes false if nvidia-smi is missing
+    bool        hasGpu_ = false;
+    std::string gpuName_;
+    double      gpuUtil_ = 0.0;         // GPU load %
+    long        gpuMemUsedMB_ = 0, gpuMemTotalMB_ = 0;
+    double      gpuTempC_ = 0.0;
 
     // --- Network throughput (Phase 2) ---
     std::vector<NetInterface> netInterfaces_;

@@ -194,6 +194,17 @@ static void draw(const SystemMonitor& mon, const std::deque<double>& history,
         << "  " << humanKB(mon.getUsedMemKB()) << " used of "
         << humanKB(mon.getTotalMemKB()) << EOL;
 
+    // --- GPU: load bar + temperature + video memory (only if a GPU is found) ---
+    if (mon.hasGpu()) {
+        double g = mon.getGpuUtil();
+        out << BOLD << "GPU       " << RESET << makeBar(g, 30)
+            << "  " << std::setw(3) << (int)(g + 0.5) << "%"
+            << "   " << loadColor(mon.getGpuTempC())
+            << (int)(mon.getGpuTempC() + 0.5) << "°C" << RESET
+            << "   " << humanKB(mon.getGpuMemUsedMB() * 1024) << " of "
+            << humanKB(mon.getGpuMemTotalMB() * 1024) << EOL;
+    }
+
     // --- Internet speed: plain Download / Upload, no per-interface clutter ---
     out << BOLD << "Internet  " << RESET
         << GREEN << "Download " << humanRate(mon.getNetRxKBps()) << RESET << "   "
@@ -213,6 +224,14 @@ static void draw(const SystemMonitor& mon, const std::deque<double>& history,
     // DETAILED-ONLY sections: swap, CPU trend, per-core, extra network/disk.
     // =====================================================================
     if (detailed) {
+        if (mon.hasGpu()) {
+            double gmemPct = mon.getGpuMemTotalMB()
+                ? 100.0 * mon.getGpuMemUsedMB() / mon.getGpuMemTotalMB() : 0.0;
+            out << BOLD << "GPU model " << RESET << mon.getGpuName() << EOL;
+            out << BOLD << "GPU memory" << RESET << makeBar(gmemPct, 30) << "  "
+                << humanKB(mon.getGpuMemUsedMB() * 1024) << " of "
+                << humanKB(mon.getGpuMemTotalMB() * 1024) << EOL;
+        }
         if (mon.getTotalSwapKB() > 0) {
             double swapPct = 100.0 * mon.getUsedSwapKB() / mon.getTotalSwapKB();
             out << BOLD << "Swap      " << RESET << makeBar(swapPct, 30) << "  "
