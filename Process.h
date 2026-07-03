@@ -18,6 +18,7 @@ class Process {
 public:
     int pid = 0;              // Process ID
     std::string name;         // Executable name (from /proc/<pid>/comm)
+    std::string cmdline;      // Full command line / argv (from /proc/<pid>/cmdline)
     char state = '?';         // R=Running, S=Sleeping, D=Uninterruptible,
                               // Z=Zombie, T=Stopped   (process life-cycle)
     long nice = 0;            // Nice value (scheduling priority hint)

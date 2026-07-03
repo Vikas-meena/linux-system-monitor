@@ -56,41 +56,50 @@ it, and a rough **effort**. Check items off as you finish them.
 
 ---
 
-## 🟡 Phase 2 — Systems features (strong "low-level" signal)
+## ✅ Phase 2 — Systems features (strong "low-level" signal) — Done
 
-- [ ] **Search / filter processes** — press `/`, type text, show only matches.
+- [x] **Search / filter processes** — press `/`, type text, show only matches.
   - *OS concept:* n/a (UX), but shows solid string handling.
-  - *Where:* add a filter string in `main`; skip non-matching names in `draw`.
+  - *Where:* filter string in `main`; case-insensitive match on name **and**
+    cmdline in `draw` (`containsCI`). ESC-empty clears it.
   - *Effort:* 🟡
 
-- [ ] **CPU temperature** — read thermal sensors. *(Very Qualcomm-relevant.)*
+- [x] **CPU temperature** — read thermal sensors. *(Very Qualcomm-relevant.)*
   - *OS concept:* thermal management, `/sys` (sysfs) interface.
-  - *Where:* read `/sys/class/thermal/thermal_zone*/temp` (milli-°C).
+  - *Where:* `SystemMonitor::readThermal` scans
+    `/sys/class/thermal/thermal_zone*/{type,temp}`, prefers a CPU zone, else
+    reports the hottest. Shown on the CPU line, colored by the load scale.
   - *Effort:* 🟡
 
-- [ ] **Network throughput** — live upload / download KB/s per interface.
+- [x] **Network throughput** — live upload / download KB/s per interface.
   - *OS concept:* same two-sample rate method; kernel network counters.
-  - *Where:* read `/proc/net/dev`; diff rx/tx bytes between refreshes.
+  - *Where:* `readNetDev` diffs rx/tx bytes from `/proc/net/dev` over the
+    measured elapsed time; totals + top 3 interfaces (loopback excluded).
   - *Effort:* 🟡
 
-- [ ] **Disk usage** — show mounted filesystems with used/total bars.
+- [x] **Disk usage** — show mounted filesystems with used/total bars.
   - *OS concept:* filesystems, mount points.
-  - *Where:* parse `/proc/mounts`, then `statvfs()` for each mount.
+  - *Where:* `readDiskUsage` parses `/proc/mounts` (real `/dev/` devices only)
+    and calls `statvfs()` per mount.
   - *Effort:* 🟡
 
-- [ ] **Disk I/O rate** — read/write throughput per device.
+- [x] **Disk I/O rate** — read/write throughput per device.
   - *OS concept:* block I/O.
-  - *Where:* read `/proc/diskstats`; diff sectors between refreshes.
+  - *Where:* `readDiskStats` diffs sectors from `/proc/diskstats`, summing
+    whole disks only (prefix test skips partitions/loop/ram to avoid double
+    counting).
   - *Effort:* 🟡
 
-- [ ] **Per-process command line** — full command instead of short name.
+- [x] **Per-process command line** — full command instead of short name.
   - *OS concept:* process arguments / `argv`.
-  - *Where:* read `/proc/<pid>/cmdline` (NUL-separated args).
+  - *Where:* `readProcesses` slurps `/proc/<pid>/cmdline` (NUL→space); press
+    `a` to toggle the NAME column between comm and full command line.
   - *Effort:* 🟢
 
-- [ ] **Renice a process** — change a process's priority interactively.
+- [x] **Renice a process** — change a process's priority interactively.
   - *OS concept:* scheduling priority, `nice`/`setpriority()`.
-  - *Where:* add a key that calls `setpriority(PRIO_PROCESS, pid, value)`.
+  - *Where:* `r` key prompts for PID + nice value →
+    `SystemMonitor::reniceProcess` calls `setpriority(PRIO_PROCESS, ...)`.
   - *Effort:* 🟡
 
 ---
@@ -148,11 +157,11 @@ it, and a rough **effort**. Check items off as you finish them.
 
 ## Suggested order
 
-If you have limited time, do **Phase 1** fully (all 🟢, ~half a day) — it adds
-the most visible value for the least risk. Then pick from Phase 2 based on
-interest: **CPU temperature** and **network throughput** give the strongest
-"I understand low-level systems" impression. Save Phase 3–4 for when you want
-to turn this into a serious portfolio piece.
+Phase 2 is now complete. The remaining quick wins in **Phase 1** (sort toggle,
+uptime/load average, task-state summary, thread count, adjustable refresh rate)
+are all 🟢 and still worth doing for polish. After that, move to **Phase 3**
+(ncurses UI, CLI args, config file, unit tests) to turn this into a serious
+portfolio piece.
 
 ## How to work on a feature
 

@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 #include <deque>         // rolling CPU history buffer
+#include <algorithm>     // std::search for case-insensitive process filter
+#include <cctype>        // std::tolower
 #include <csignal>       // SIGTERM, SIGKILL
 #include <termios.h>     // terminal mode control (raw / cooked)
 #include <unistd.h>      // read, STDIN_FILENO
@@ -123,88 +125,191 @@ static std::string humanKB(long kb) {
     return os.str();
 }
 
+// Turn a KB/s rate into a human-friendly string (KB/s or MB/s).
+static std::string humanRate(double kbps) {
+    double v = kbps;
+    const char* unit = "KB/s";
+    if (v >= 1024) { v /= 1024; unit = "MB/s"; }
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(1) << v << unit;
+    return os.str();
+}
+
+// Translate a kernel process-state letter into a plain-English word, so the
+// detailed view doesn't make people memorize R/S/D/Z/T.
+static std::string stateWord(char s) {
+    switch (s) {
+        case 'R': return "Running";
+        case 'S': return "Sleeping";
+        case 'D': return "Waiting";   // uninterruptible (usually disk I/O)
+        case 'Z': return "Zombie";
+        case 'T': return "Stopped";
+        case 'I': return "Idle";
+        default:  return "-";
+    }
+}
+
+// Case-insensitive "does haystack contain needle?" — used by process search.
+static bool containsCI(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    auto it = std::search(
+        haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+        [](char a, char b) { return std::tolower((unsigned char)a) ==
+                                    std::tolower((unsigned char)b); });
+    return it != haystack.end();
+}
+
 // Draw one refresh IN PLACE.
 // Instead of clearing the whole screen (which flickers and scrolls), we move
 // the cursor to the top-left with HOME and overwrite the old text line by line.
 // Every line ends with EOL ("\033[K\n") to erase leftovers from the last frame,
 // and we finish with CLR_BELOW to wipe any lines the new frame didn't cover.
 // `history` holds recent overall-CPU% values so we can draw a trend graph.
-static void draw(const SystemMonitor& mon, const std::deque<double>& history) {
+// The screen has two modes:
+//   SIMPLE (default)  — a clean, plain-language overview for everyday users.
+//   DETAILED ('d')    — adds swap, CPU history, per-core bars, per-interface
+//                       network, disk I/O and the process state/priority columns
+//                       for people who want the technical picture.
+static void draw(const SystemMonitor& mon, const std::deque<double>& history,
+                 const std::string& filter, bool showCmdline, bool detailed) {
     std::ostringstream out;                 // build the whole frame, print once
     out << HOME;
-    out << BOLD << CYAN
-        << "=== Linux System Monitor (C++) ===" << RESET << EOL << EOL;
+    out << BOLD << CYAN << "=== System Monitor ===" << RESET
+        << (detailed ? "  (detailed view)" : "") << EOL << EOL;
 
-    out << std::fixed << std::setprecision(1);
-
-    // --- CPU with a bar graph ---
+    // --- CPU: a bar + a whole-number percent (plus temperature if available) ---
     double cpu = mon.getCpuPercent();
-    out << BOLD << "CPU  " << RESET << makeBar(cpu, 30) << "  " << cpu << "%" << EOL;
-
-    // --- RAM with a bar graph ---
-    double memPct = mon.getTotalMemKB()
-                  ? 100.0 * mon.getUsedMemKB() / mon.getTotalMemKB() : 0.0;
-    out << BOLD << "RAM  " << RESET << makeBar(memPct, 30) << "  "
-        << humanKB(mon.getUsedMemKB()) << " / "
-        << humanKB(mon.getTotalMemKB()) << EOL;
-
-    // --- Swap with a bar graph (only if swap exists) ---
-    if (mon.getTotalSwapKB() > 0) {
-        double swapPct = 100.0 * mon.getUsedSwapKB() / mon.getTotalSwapKB();
-        out << BOLD << "Swap " << RESET << makeBar(swapPct, 30) << "  "
-            << humanKB(mon.getUsedSwapKB()) << " / "
-            << humanKB(mon.getTotalSwapKB()) << EOL;
+    out << BOLD << "CPU       " << RESET << makeBar(cpu, 30)
+        << "  " << std::setw(3) << (int)(cpu + 0.5) << "%";
+    if (mon.hasCpuTemp()) {
+        double t = mon.getCpuTempC();
+        out << "   " << loadColor(t) << (int)(t + 0.5) << "°C" << RESET;
     }
-
-    // --- CPU history as a scrolling sparkline graph ---
-    out << EOL << BOLD << "CPU history " << RESET << "(last "
-        << history.size() << "s):" << EOL << "  ";
-    for (double v : history) out << loadColor(v) << spark(v) << RESET;
     out << EOL;
 
-    // --- Per-core CPU bars, packed several per row to stay compact ---
-    out << EOL << BOLD << "Per-core:" << RESET << EOL;
-    const auto& cores = mon.getCorePercents();
-    const int PER_ROW = 4;                  // how many core bars on one line
-    for (size_t i = 0; i < cores.size(); ++i) {
-        std::ostringstream cell;
-        cell << "C" << std::left << std::setw(2) << i;      // e.g. "C0 "
-        out << "  " << cell.str() << makeBar(cores[i], 8)
-            << std::right << std::setw(6) << cores[i] << "% ";
-        if ((int)((i + 1) % PER_ROW) == 0) out << EOL;      // end of a row
+    // --- Memory: bar + how much is in use out of the total ---
+    double memPct = mon.getTotalMemKB()
+                  ? 100.0 * mon.getUsedMemKB() / mon.getTotalMemKB() : 0.0;
+    out << BOLD << "Memory    " << RESET << makeBar(memPct, 30)
+        << "  " << humanKB(mon.getUsedMemKB()) << " used of "
+        << humanKB(mon.getTotalMemKB()) << EOL;
+
+    // --- Internet speed: plain Download / Upload, no per-interface clutter ---
+    out << BOLD << "Internet  " << RESET
+        << GREEN << "Download " << humanRate(mon.getNetRxKBps()) << RESET << "   "
+        << CYAN  << "Upload "   << humanRate(mon.getNetTxKBps()) << RESET << EOL;
+
+    // --- Storage: one line per real disk, used out of total ---
+    const auto& mounts = mon.getDiskMounts();
+    for (const auto& m : mounts) {
+        out << BOLD << "Storage   " << RESET
+            << std::left << std::setw(8) << m.mountPoint.substr(0, 8)
+            << makeBar(m.usedPct, 18) << "  "
+            << (int)(m.usedPct + 0.5) << "% full ("
+            << humanKB(m.usedKB) << " of " << humanKB(m.totalKB) << ")" << EOL;
     }
-    if (cores.size() % PER_ROW != 0) out << EOL;            // finish last row
 
-    // --- process table header ---
-    out << EOL << BOLD << GREEN << std::left
+    // =====================================================================
+    // DETAILED-ONLY sections: swap, CPU trend, per-core, extra network/disk.
+    // =====================================================================
+    if (detailed) {
+        if (mon.getTotalSwapKB() > 0) {
+            double swapPct = 100.0 * mon.getUsedSwapKB() / mon.getTotalSwapKB();
+            out << BOLD << "Swap      " << RESET << makeBar(swapPct, 30) << "  "
+                << humanKB(mon.getUsedSwapKB()) << " of "
+                << humanKB(mon.getTotalSwapKB()) << EOL;
+        }
+
+        out << EOL << BOLD << "CPU history " << RESET << "(last "
+            << history.size() << "s):" << EOL << "  ";
+        for (double v : history) out << loadColor(v) << spark(v) << RESET;
+        out << EOL;
+
+        out << EOL << BOLD << "Per-core:" << RESET << EOL;
+        const auto& cores = mon.getCorePercents();
+        const int PER_ROW = 4;
+        for (size_t i = 0; i < cores.size(); ++i) {
+            std::ostringstream cell;
+            cell << "C" << std::left << std::setw(2) << i;
+            out << "  " << cell.str() << makeBar(cores[i], 8)
+                << std::right << std::setw(5) << (int)(cores[i] + 0.5) << "% ";
+            if ((int)((i + 1) % PER_ROW) == 0) out << EOL;
+        }
+        if (cores.size() % PER_ROW != 0) out << EOL;
+
+        const auto& ifaces = mon.getNetInterfaces();
+        if (!ifaces.empty()) {
+            out << EOL << BOLD << "Network by connection:" << RESET << EOL;
+            int ifShown = 0;
+            for (const auto& ni : ifaces) {
+                if (ifShown++ >= 3) break;
+                out << "  " << std::left << std::setw(10) << ni.name.substr(0, 10)
+                    << GREEN << "down " << std::right << std::setw(9)
+                    << humanRate(ni.rxKBps) << RESET << "  "
+                    << CYAN  << "up "   << std::setw(9)
+                    << humanRate(ni.txKBps) << RESET << EOL;
+            }
+        }
+
+        out << EOL << BOLD << "Disk activity  " << RESET
+            << YELLOW << "reading " << humanRate(mon.getDiskReadKBps())  << RESET
+            << "   " << YELLOW << "writing " << humanRate(mon.getDiskWriteKBps())
+            << RESET << EOL;
+    }
+
+    // =====================================================================
+    // Program list (always shown).
+    // =====================================================================
+    out << EOL;
+    if (!filter.empty()) {
+        out << BOLD << YELLOW << "Showing only: \"" << filter << "\"" << RESET
+            << "  (press / to change)" << EOL;
+    }
+
+    const char* nameCol = showCmdline ? "COMMAND" : "PROGRAM";
+    out << BOLD << GREEN << std::left
         << std::setw(8)  << "PID"
-        << std::setw(18) << "NAME"
-        << std::setw(7)  << "STATE"
         << std::setw(8)  << "CPU%"
-        << std::setw(6)  << "NICE"
-        << std::setw(10) << "MEM"
-        << RESET << EOL;
+        << std::setw(11) << "MEMORY";
+    if (detailed) out << std::setw(10) << "STATUS" << std::setw(10) << "PRIORITY";
+    out << nameCol << RESET << EOL;
 
-    // --- top processes by CPU ---
     const auto& procs = mon.getProcesses();
-    int shown = 0;
+    int shown = 0, matched = 0;
+    const int LIMIT = detailed ? 15 : 8;    // shorter list in simple mode
     for (const auto& p : procs) {
-        if (shown++ >= 10) break;           // top 10 keeps the screen compact
+        if (!filter.empty() &&
+            !containsCI(p.name, filter) && !containsCI(p.cmdline, filter))
+            continue;
+        ++matched;
+        if (shown++ >= LIMIT) continue;
 
         std::ostringstream cpuStr;
-        cpuStr << std::fixed << std::setprecision(1) << p.cpuPercent;
+        cpuStr << (int)(p.cpuPercent + 0.5) << "%";
+
+        std::string label = showCmdline ? p.cmdline : p.name;
+        if (label.size() > 55) label = label.substr(0, 52) + "...";
 
         out << std::left
             << std::setw(8)  << p.pid
-            << std::setw(18) << p.name.substr(0, 17)
-            << std::setw(7)  << p.state
             << std::setw(8)  << cpuStr.str()
-            << std::setw(6)  << p.nice
-            << std::setw(10) << humanKB(p.memKB)
-            << EOL;
+            << std::setw(11) << humanKB(p.memKB);
+        if (detailed)
+            out << std::setw(10) << stateWord(p.state) << std::setw(10) << p.nice;
+        out << label << EOL;
     }
+    if (matched > shown)
+        out << "  ... and " << (matched - shown) << " more" << EOL;
 
-    out << EOL << "[q] quit   [k] kill process" << EOL;
+    // --- footer: a short menu in simple mode, the full one in detailed ---
+    out << EOL;
+    if (detailed) {
+        out << "[q] quit  [k] stop  [r] priority  [/] find  [a] "
+            << (showCmdline ? "short names" : "full command")
+            << "  [d] simple view" << EOL;
+    } else {
+        out << "[q] quit  [k] stop a program  [/] find  [d] more detail" << EOL;
+    }
     out << CLR_BELOW;                        // erase any old lines below the frame
 
     std::cout << out.str();                  // one write = no flicker
@@ -228,6 +333,10 @@ int main() {
     std::deque<double> cpuHistory;      // rolling window of overall CPU%
     const size_t HISTORY_LEN = 60;      // keep ~60 samples (~60 seconds)
 
+    std::string filter;                 // process search filter ('/' key)
+    bool showCmdline = false;           // show full command line vs short name ('a')
+    bool detailed = false;              // simple overview vs technical view ('d')
+
     bool running = true;
     while (running) {
         mon.update();
@@ -237,11 +346,47 @@ int main() {
         cpuHistory.push_back(mon.getCpuPercent());
         if (cpuHistory.size() > HISTORY_LEN) cpuHistory.pop_front();
 
-        draw(mon, cpuHistory);          // draws in place + its own footer
+        draw(mon, cpuHistory, filter, showCmdline, detailed);  // draws in place
 
         char key = pollKey();                         // waits up to 1s
         if (key == 'q') {
             running = false;
+        } else if (key == 'd') {
+            detailed = !detailed;                     // toggle simple / detailed view
+        } else if (key == 'a') {
+            showCmdline = !showCmdline;               // toggle name / command line
+        } else if (key == '/') {
+            // Prompt for a search filter. Drop to cooked mode so the user can
+            // type and edit a full line comfortably; an empty line clears it.
+            disableRawMode();
+            std::cout << CLEAR_SCREEN << SHOW_CURSOR;
+            std::cout << "Filter processes (empty = clear): ";
+            std::cout.flush();
+            std::getline(std::cin, filter);
+            enableRawMode();
+            std::cout << CLEAR_SCREEN << HIDE_CURSOR;
+            std::cout.flush();
+        } else if (key == 'r') {
+            // Renice: change a process's scheduling priority interactively.
+            disableRawMode();
+            std::cout << CLEAR_SCREEN << SHOW_CURSOR;
+            std::cout << "Enter PID to renice: ";
+            std::cout.flush();
+            int pid = 0;
+            std::cin >> pid;
+            std::cout << "New nice value (-20 highest .. 19 lowest): ";
+            int nv = 0;
+            std::cin >> nv;
+            bool ok = SystemMonitor::reniceProcess(pid, nv);
+            std::cout << (ok ? "Priority changed.\n"
+                             : "Failed (need privileges to raise priority, "
+                               "or no such PID).\n");
+            std::cout << "Press Enter to continue...";
+            std::cin.ignore();
+            std::cin.get();
+            enableRawMode();
+            std::cout << CLEAR_SCREEN << HIDE_CURSOR;
+            std::cout.flush();
         } else if (key == 'k') {
             // Temporarily go back to normal (cooked) input so the user can
             // type a full PID and press Enter comfortably.

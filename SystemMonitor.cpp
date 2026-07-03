@@ -4,11 +4,14 @@
 #include <sstream>     // std::istringstream -> tokenize a line
 #include <string>
 #include <vector>
+#include <iterator>    // std::istreambuf_iterator -> slurp a whole file
 #include <cctype>      // isdigit
 #include <dirent.h>    // opendir/readdir -> list /proc directory entries
 #include <unistd.h>    // sysconf, getpagesize
 #include <csignal>     // kill(), SIGTERM, SIGKILL
 #include <algorithm>   // std::sort
+#include <sys/statvfs.h> // statvfs() -> free/total space of a mount
+#include <sys/resource.h>// setpriority() -> renice a process
 
 // ===========================================================================
 // Constructor: figure out how many CPU cores we have.
@@ -26,9 +29,23 @@ SystemMonitor::SystemMonitor() {
 // total-jiffies delta that readProcesses() reuses for per-process CPU%.
 // ===========================================================================
 void SystemMonitor::update() {
+    // Measure elapsed wall-clock time since the last refresh so the rate
+    // metrics (network, disk I/O) can convert a byte/sector delta into per-second
+    // throughput. The refresh loop aims for ~1s but is never exactly 1s.
+    auto now = std::chrono::steady_clock::now();
+    dtSec_ = haveLastTime_
+           ? std::chrono::duration<double>(now - lastTime_).count()
+           : 0.0;
+    lastTime_ = now;
+    haveLastTime_ = true;
+
     readMemInfo();
     readCpuStat();
     readProcesses();
+    readThermal();
+    readNetDev();
+    readDiskStats();
+    readDiskUsage();
 }
 
 // ===========================================================================
@@ -173,6 +190,19 @@ void SystemMonitor::readProcesses() {
             std::getline(comm, p.name);
         }
 
+        // --- full command line: /proc/<pid>/cmdline ---
+        // The arguments (argv) are stored NUL-separated with a trailing NUL, so
+        // we read the whole thing and turn '\0' into spaces. It's empty for
+        // kernel threads, in which case we fall back to the bracketed comm name.
+        {
+            std::ifstream cmd("/proc/" + name + "/cmdline", std::ios::binary);
+            std::string raw((std::istreambuf_iterator<char>(cmd)),
+                             std::istreambuf_iterator<char>());
+            for (char& c : raw) if (c == '\0') c = ' ';
+            while (!raw.empty() && raw.back() == ' ') raw.pop_back();
+            p.cmdline = raw.empty() ? ("[" + p.name + "]") : raw;
+        }
+
         // --- stat: /proc/<pid>/stat ---
         // Tricky part: field 2 (comm) is wrapped in parentheses and may itself
         // contain spaces or ')'. The safe trick is to split on the LAST ')':
@@ -246,4 +276,257 @@ void SystemMonitor::readProcesses() {
 // ===========================================================================
 bool SystemMonitor::killProcess(int pid, int signal) {
     return kill(pid, signal) == 0;
+}
+
+// ===========================================================================
+// reniceProcess(): change a process's scheduling priority (Phase 2).
+// ---------------------------------------------------------------------------
+// setpriority(PRIO_PROCESS, pid, nice) sets the "nice" value, the scheduler's
+// hint about how greedy a process may be for CPU time: -20 = highest priority,
+// 19 = lowest. Raising priority (a more negative value) needs privileges.
+// ===========================================================================
+bool SystemMonitor::reniceProcess(int pid, int niceValue) {
+    if (niceValue < -20) niceValue = -20;
+    if (niceValue >  19) niceValue =  19;
+    return setpriority(PRIO_PROCESS, pid, niceValue) == 0;
+}
+
+// ===========================================================================
+// readThermal(): CPU temperature from sysfs (Phase 2).
+// ---------------------------------------------------------------------------
+// The kernel exposes thermal sensors under /sys/class/thermal/thermal_zone*/:
+//   type -> a label like "x86_pkg_temp", "cpu-thermal", "acpitz"
+//   temp -> temperature in milli-degrees Celsius (e.g. 47000 == 47.0 °C)
+// A machine can have several zones. We prefer a CPU-package zone; failing that
+// we report the hottest zone as a reasonable "system temperature".
+// ===========================================================================
+void SystemMonitor::readThermal() {
+    hasCpuTemp_ = false;
+    double best = -1.0;                 // hottest zone seen (fallback)
+    std::string bestLabel;
+
+    DIR* dir = opendir("/sys/class/thermal");
+    if (!dir) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string zone = entry->d_name;
+        if (zone.rfind("thermal_zone", 0) != 0) continue;   // only zones
+
+        std::string base = "/sys/class/thermal/" + zone;
+
+        long milli = 0;
+        {
+            std::ifstream tf(base + "/temp");
+            if (!(tf >> milli)) continue;                   // unreadable zone
+        }
+        double celsius = milli / 1000.0;
+
+        std::string type;
+        {
+            std::ifstream tyf(base + "/type");
+            std::getline(tyf, type);
+        }
+
+        // Prefer a zone that clearly names the CPU. Take it immediately.
+        if (type.find("x86_pkg") != std::string::npos ||
+            type.find("cpu")     != std::string::npos ||
+            type.find("coretemp")!= std::string::npos ||
+            type.find("k10temp") != std::string::npos) {
+            cpuTempC_     = celsius;
+            cpuTempLabel_ = type;
+            hasCpuTemp_   = true;
+            closedir(dir);
+            return;
+        }
+
+        if (celsius > best) { best = celsius; bestLabel = type; }
+    }
+    closedir(dir);
+
+    if (best >= 0.0) {                  // no CPU-specific zone; use the hottest
+        cpuTempC_     = best;
+        cpuTempLabel_ = bestLabel.empty() ? "thermal" : bestLabel;
+        hasCpuTemp_   = true;
+    }
+}
+
+// ===========================================================================
+// readNetDev(): per-interface network throughput (Phase 2).
+// ---------------------------------------------------------------------------
+// /proc/net/dev has two header lines, then one line per interface:
+//   iface: rxBytes rxPackets ... (8 rx fields) txBytes txPackets ... (8 tx)
+// rxBytes/txBytes are cumulative since boot, so we diff them against the last
+// sample and divide by elapsed seconds — the same rate method as CPU%.
+// ===========================================================================
+void SystemMonitor::readNetDev() {
+    netInterfaces_.clear();
+    netRxKBps_ = netTxKBps_ = 0.0;
+
+    std::ifstream file("/proc/net/dev");
+    if (!file.is_open()) return;
+
+    std::string line;
+    std::getline(file, line);           // header line 1
+    std::getline(file, line);           // header line 2
+
+    std::map<std::string, std::pair<unsigned long long, unsigned long long>> current;
+
+    while (std::getline(file, line)) {
+        std::size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string name = line.substr(0, colon);
+        // Trim leading whitespace from the interface name.
+        std::size_t s = name.find_first_not_of(" \t");
+        if (s != std::string::npos) name = name.substr(s);
+
+        std::istringstream ss(line.substr(colon + 1));
+        std::vector<unsigned long long> v;
+        unsigned long long x;
+        while (ss >> x) v.push_back(x);
+        if (v.size() < 16) continue;    // need at least 8 rx + 8 tx fields
+
+        unsigned long long rx = v[0];   // rx bytes
+        unsigned long long tx = v[8];   // tx bytes (9th field)
+        current[name] = {rx, tx};
+
+        NetInterface ni;
+        ni.name = name;
+        auto it = prevNet_.find(name);
+        if (it != prevNet_.end() && dtSec_ > 0.0) {
+            double drx = static_cast<double>(rx - it->second.first);
+            double dtx = static_cast<double>(tx - it->second.second);
+            if (drx < 0) drx = 0;       // guard counter resets
+            if (dtx < 0) dtx = 0;
+            ni.rxKBps = drx / dtSec_ / 1024.0;
+            ni.txKBps = dtx / dtSec_ / 1024.0;
+        }
+
+        // Skip the loopback interface in the totals and the display list — it's
+        // internal traffic, not real network I/O.
+        if (name != "lo") {
+            netRxKBps_ += ni.rxKBps;
+            netTxKBps_ += ni.txKBps;
+            netInterfaces_.push_back(ni);
+        }
+    }
+
+    prevNet_ = std::move(current);
+
+    // Show the busiest interfaces first.
+    std::sort(netInterfaces_.begin(), netInterfaces_.end(),
+              [](const NetInterface& a, const NetInterface& b) {
+                  return (a.rxKBps + a.txKBps) > (b.rxKBps + b.txKBps);
+              });
+}
+
+// ===========================================================================
+// readDiskStats(): aggregate disk read/write throughput (Phase 2).
+// ---------------------------------------------------------------------------
+// /proc/diskstats has one line per block device:
+//   major minor name reads rdMerged sectorsRead ... writes wrMerged sectorsWritten ...
+// Sectors are 512 bytes. We sum sectors across WHOLE disks only (a device is a
+// partition if another device name is a prefix of it, e.g. sda -> sda1,
+// nvme0n1 -> nvme0n1p1), skipping loop/ram devices, so we don't double-count.
+// Then we diff the totals against the previous sample -> KB/s.
+// ===========================================================================
+void SystemMonitor::readDiskStats() {
+    diskReadKBps_ = diskWriteKBps_ = 0.0;
+
+    std::ifstream file("/proc/diskstats");
+    if (!file.is_open()) return;
+
+    struct Dev { std::string name; unsigned long long rd, wr; };
+    std::vector<Dev> devs;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream ss(line);
+        std::string major, minor, name;
+        unsigned long long reads, rdMerged, sectorsRead, msRead,
+                           writes, wrMerged, sectorsWritten;
+        if (!(ss >> major >> minor >> name
+                 >> reads >> rdMerged >> sectorsRead >> msRead
+                 >> writes >> wrMerged >> sectorsWritten))
+            continue;
+        if (name.rfind("loop", 0) == 0 || name.rfind("ram", 0) == 0) continue;
+        devs.push_back({name, sectorsRead, sectorsWritten});
+    }
+
+    // Sum only whole disks: skip any device whose name has another device's
+    // name as a proper prefix (that makes it a partition of that disk).
+    unsigned long long totalRead = 0, totalWrite = 0;
+    for (const auto& d : devs) {
+        bool isPartition = false;
+        for (const auto& other : devs) {
+            if (other.name.size() < d.name.size() &&
+                d.name.compare(0, other.name.size(), other.name) == 0) {
+                isPartition = true;
+                break;
+            }
+        }
+        if (isPartition) continue;
+        totalRead  += d.rd;
+        totalWrite += d.wr;
+    }
+
+    if (haveDiskStats_ && dtSec_ > 0.0) {
+        double drd = static_cast<double>(totalRead  - prevReadSectors_);
+        double dwr = static_cast<double>(totalWrite - prevWriteSectors_);
+        if (drd < 0) drd = 0;
+        if (dwr < 0) dwr = 0;
+        // sectors * 512 bytes / 1024 == sectors / 2  KB.
+        diskReadKBps_  = (drd * 512.0 / 1024.0) / dtSec_;
+        diskWriteKBps_ = (dwr * 512.0 / 1024.0) / dtSec_;
+    }
+    prevReadSectors_  = totalRead;
+    prevWriteSectors_ = totalWrite;
+    haveDiskStats_    = true;
+}
+
+// ===========================================================================
+// readDiskUsage(): capacity of each real mounted filesystem (Phase 2).
+// ---------------------------------------------------------------------------
+// /proc/mounts lists every mount as "device mountpoint fstype options ...".
+// We keep only mounts backed by a real block device (device starts with
+// "/dev/"), which filters out pseudo filesystems (proc, sysfs, tmpfs, cgroup).
+// statvfs() then reports block counts we turn into used/total KB.
+// ===========================================================================
+void SystemMonitor::readDiskUsage() {
+    diskMounts_.clear();
+
+    std::ifstream file("/proc/mounts");
+    if (!file.is_open()) return;
+
+    std::string device, mountPoint, fsType, rest;
+    while (file >> device >> mountPoint >> fsType) {
+        std::getline(file, rest);       // consume options + rest of the line
+
+        if (device.rfind("/dev/", 0) != 0) continue;   // real devices only
+
+        // Skip a mount point we already recorded (bind mounts show up twice).
+        bool dup = false;
+        for (const auto& m : diskMounts_)
+            if (m.mountPoint == mountPoint) { dup = true; break; }
+        if (dup) continue;
+
+        struct statvfs vfs;
+        if (statvfs(mountPoint.c_str(), &vfs) != 0) continue;
+
+        // f_frsize is the fundamental block size in bytes.
+        unsigned long long total = (unsigned long long)vfs.f_blocks * vfs.f_frsize;
+        unsigned long long avail = (unsigned long long)vfs.f_bavail * vfs.f_frsize;
+        unsigned long long used  = total - (unsigned long long)vfs.f_bfree * vfs.f_frsize;
+        if (total == 0) continue;       // skip empty pseudo mounts
+
+        DiskMount dm;
+        dm.device     = device;
+        dm.mountPoint = mountPoint;
+        dm.fsType     = fsType;
+        dm.totalKB    = static_cast<long>(total / 1024);
+        dm.usedKB     = static_cast<long>(used  / 1024);
+        dm.usedPct    = 100.0 * used / total;
+        (void)avail;                    // available space is implied by total-used
+        diskMounts_.push_back(dm);
+    }
 }
