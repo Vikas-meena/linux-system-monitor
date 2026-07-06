@@ -24,34 +24,37 @@ it, and a rough **effort**. Check items off as you finish them.
 
 ---
 
-## 🟢 Phase 1 — Quick wins (high value, low effort)
+## ✅ Phase 1 — Quick wins (high value, low effort) — Done
 
-- [ ] **Sort toggle** — keys `c` / `m` / `p` to sort by CPU / memory / PID.
+- [x] **Sort toggle** — keys `c` / `m` / `p` to sort by CPU / memory / PID.
   - *OS concept:* scheduling priority, resource accounting.
-  - *Where:* change the `std::sort` comparator in `SystemMonitor::readProcesses`
-    (or store a "sort mode" and sort in `draw`). Handle the keys in `main`.
+  - *Where:* `SortMode` enum + `setSortMode()`; `readProcesses` picks the
+    `std::sort` comparator by mode (CPU/mem descending, PID ascending). `main`
+    maps the keys; the footer shows the current column.
   - *Effort:* 🟢
 
-- [ ] **Uptime & load average** — show system uptime and 1/5/15-min load.
+- [x] **Uptime & load average** — show system uptime and 1/5/15-min load.
   - *OS concept:* load average = avg number of runnable/uninterruptible tasks.
-  - *Where:* read `/proc/uptime` (seconds) and `/proc/loadavg` (3 numbers).
-    New methods in `SystemMonitor`, print them in `draw`.
+  - *Where:* `readUptime` reads `/proc/uptime`, `readLoadAvg` reads
+    `/proc/loadavg`; shown on an "Up … Load …" line under the title.
   - *Effort:* 🟢
 
-- [ ] **Process state summary** — e.g. `Tasks: 378 (2 running, 1 zombie, ...)`.
+- [x] **Process state summary** — e.g. `Tasks: 378 (2 running, 1 zombie, ...)`.
   - *OS concept:* process life-cycle / states (R, S, D, Z, T).
-  - *Where:* while walking processes, count each `state`; expose counts; print.
+  - *Where:* `readProcesses` tallies each `state` into a `TaskCounts` struct;
+    printed as a "Tasks" line above the process table.
   - *Effort:* 🟢
 
-- [ ] **Total thread count** — sum of threads across processes.
+- [x] **Total thread count** — sum of threads across processes.
   - *OS concept:* threads vs processes.
-  - *Where:* count entries in `/proc/<pid>/task/`, or read `Threads:` from
-    `/proc/<pid>/status`.
+  - *Where:* `readProcesses` reads `Threads:` from `/proc/<pid>/status` and sums
+    into `TaskCounts::threads`; shown on the same "Tasks" line.
   - *Effort:* 🟢
 
-- [ ] **Adjustable refresh rate** — `+` / `-` keys change the interval.
+- [x] **Adjustable refresh rate** — `+` / `-` keys change the interval.
   - *OS concept:* sampling / polling trade-offs.
-  - *Where:* make the `select()` timeout in `pollKey` a variable.
+  - *Where:* `pollKey` takes an `intervalSec`; `main` adjusts it in 0.2s steps
+    (0.2–10s) on `+`/`-`; the footer shows the current rate.
   - *Effort:* 🟢
 
 ---
@@ -161,11 +164,8 @@ it, and a rough **effort**. Check items off as you finish them.
 
 ## Suggested order
 
-Phase 2 is now complete. The remaining quick wins in **Phase 1** (sort toggle,
-uptime/load average, task-state summary, thread count, adjustable refresh rate)
-are all 🟢 and still worth doing for polish. After that, move to **Phase 3**
-(ncurses UI, CLI args, config file, unit tests) to turn this into a serious
-portfolio piece.
+Phases 1 and 2 are now complete. Next, move to **Phase 3** (ncurses UI, CLI
+args, config file, unit tests) to turn this into a serious portfolio piece.
 
 ## How to work on a feature
 

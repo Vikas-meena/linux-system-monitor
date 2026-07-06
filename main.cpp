@@ -5,8 +5,12 @@
 // reading the /proc filesystem — a hands-on tour of OS process/memory concepts.
 //
 // Controls:
-//     q        quit
-//     k        kill a process (prompts for PID + signal)
+//     q          quit
+//     k          kill a process (prompts for PID + signal)
+//     r          renice a process (change scheduling priority)
+//     / a d      find / toggle command line / toggle detailed view
+//     c m p      sort the process list by CPU / memory / PID
+//     + -        slow down / speed up the refresh interval
 //
 // Display refreshes about once per second using ANSI escape codes (no external
 // libraries needed).
@@ -99,14 +103,17 @@ static void disableRawMode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_originalTermios);
 }
 
-// Return a pressed key if one is waiting, else 0. Uses select() with a 1-second
-// timeout, which doubles as our refresh interval: it sleeps up to 1s but wakes
-// instantly if the user presses a key.
-static char pollKey() {
+// Return a pressed key if one is waiting, else 0. Uses select() with a timeout,
+// which doubles as our refresh interval: it sleeps up to `intervalSec` seconds
+// but wakes instantly if the user presses a key. The interval is adjustable at
+// runtime with the +/- keys (Phase 1).
+static char pollKey(double intervalSec) {
     fd_set set;
     FD_ZERO(&set);
     FD_SET(STDIN_FILENO, &set);
-    struct timeval timeout{1, 0};                     // 1 second, 0 microsec
+    struct timeval timeout;
+    timeout.tv_sec  = static_cast<long>(intervalSec);
+    timeout.tv_usec = static_cast<long>((intervalSec - timeout.tv_sec) * 1e6);
     if (select(STDIN_FILENO + 1, &set, nullptr, nullptr, &timeout) > 0) {
         char c;
         if (read(STDIN_FILENO, &c, 1) == 1) return c;
@@ -133,6 +140,31 @@ static std::string humanRate(double kbps) {
     std::ostringstream os;
     os << std::fixed << std::setprecision(1) << v << unit;
     return os.str();
+}
+
+// Turn a number of seconds into a compact "3d 04:12:07" / "12:34" uptime string.
+static std::string formatUptime(double seconds) {
+    long s = static_cast<long>(seconds);
+    long days  = s / 86400; s %= 86400;
+    long hours = s / 3600;  s %= 3600;
+    long mins  = s / 60;    long secs = s % 60;
+    std::ostringstream os;
+    if (days > 0) os << days << "d ";
+    os << std::setfill('0');
+    if (days > 0 || hours > 0)
+        os << std::setw(2) << hours << ":";
+    os << std::setw(2) << mins << ":" << std::setw(2) << secs;
+    return os.str();
+}
+
+// Human-readable name for the current sort column, shown in the footer.
+static const char* sortName(SortMode m) {
+    switch (m) {
+        case SortMode::MEM: return "memory";
+        case SortMode::PID: return "PID";
+        case SortMode::CPU:
+        default:            return "CPU";
+    }
 }
 
 // Translate a kernel process-state letter into a plain-English word, so the
@@ -171,11 +203,21 @@ static bool containsCI(const std::string& haystack, const std::string& needle) {
 //                       network, disk I/O and the process state/priority columns
 //                       for people who want the technical picture.
 static void draw(const SystemMonitor& mon, const std::deque<double>& history,
-                 const std::string& filter, bool showCmdline, bool detailed) {
+                 const std::string& filter, bool showCmdline, bool detailed,
+                 double intervalSec) {
     std::ostringstream out;                 // build the whole frame, print once
     out << HOME;
     out << BOLD << CYAN << "=== System Monitor ===" << RESET
-        << (detailed ? "  (detailed view)" : "") << EOL << EOL;
+        << (detailed ? "  (detailed view)" : "") << EOL;
+
+    // --- Uptime + load average (Phase 1) ---
+    // Load average = avg number of runnable/uninterruptible tasks over 1/5/15
+    // min. As a rule of thumb, a value near the core count means fully loaded.
+    out << BOLD << "Up        " << RESET << formatUptime(mon.getUptimeSec())
+        << "    " << BOLD << "Load " << RESET
+        << std::fixed << std::setprecision(2)
+        << mon.getLoad1()  << " " << mon.getLoad5() << " " << mon.getLoad15()
+        << "  (1/5/15 min)" << EOL << EOL;
 
     // --- CPU: a bar + a whole-number percent (plus temperature if available) ---
     double cpu = mon.getCpuPercent();
@@ -280,10 +322,22 @@ static void draw(const SystemMonitor& mon, const std::deque<double>& history,
     // Program list (always shown).
     // =====================================================================
     out << EOL;
+
+    // --- Task/thread summary (Phase 1): counts by process state ---
+    const auto& tc = mon.getTaskCounts();
+    out << BOLD << "Tasks     " << RESET << tc.total << " total"
+        << ", " << GREEN << tc.running << " running" << RESET
+        << ", " << tc.sleeping << " sleeping";
+    if (tc.stopped > 0) out << ", " << tc.stopped << " stopped";
+    if (tc.zombie  > 0) out << ", " << RED << tc.zombie << " zombie" << RESET;
+    out << "   " << tc.threads << " threads" << EOL;
+
     if (!filter.empty()) {
         out << BOLD << YELLOW << "Showing only: \"" << filter << "\"" << RESET
             << "  (press / to change)" << EOL;
     }
+    out << "Sorted by " << BOLD << sortName(mon.getSortMode()) << RESET
+        << "  (c/m/p to change)" << EOL;
 
     const char* nameCol = showCmdline ? "COMMAND" : "PROGRAM";
     out << BOLD << GREEN << std::left
@@ -322,12 +376,15 @@ static void draw(const SystemMonitor& mon, const std::deque<double>& history,
 
     // --- footer: a short menu in simple mode, the full one in detailed ---
     out << EOL;
+    std::ostringstream rate;
+    rate << std::fixed << std::setprecision(1) << intervalSec << "s";
     if (detailed) {
-        out << "[q] quit  [k] stop  [r] priority  [/] find  [a] "
+        out << "[q] quit  [k] stop  [r] priority  [/] find  [c/m/p] sort  [a] "
             << (showCmdline ? "short names" : "full command")
-            << "  [d] simple view" << EOL;
+            << "  [+/-] rate " << rate.str() << "  [d] simple view" << EOL;
     } else {
-        out << "[q] quit  [k] stop a program  [/] find  [d] more detail" << EOL;
+        out << "[q] quit  [k] stop  [/] find  [c/m/p] sort  [+/-] rate "
+            << rate.str() << "  [d] more detail" << EOL;
     }
     out << CLR_BELOW;                        // erase any old lines below the frame
 
@@ -355,6 +412,8 @@ int main() {
     std::string filter;                 // process search filter ('/' key)
     bool showCmdline = false;           // show full command line vs short name ('a')
     bool detailed = false;              // simple overview vs technical view ('d')
+    double interval = 1.0;              // refresh interval in seconds ('+' / '-')
+    const double MIN_INTERVAL = 0.2, MAX_INTERVAL = 10.0;
 
     bool running = true;
     while (running) {
@@ -365,15 +424,27 @@ int main() {
         cpuHistory.push_back(mon.getCpuPercent());
         if (cpuHistory.size() > HISTORY_LEN) cpuHistory.pop_front();
 
-        draw(mon, cpuHistory, filter, showCmdline, detailed);  // draws in place
+        draw(mon, cpuHistory, filter, showCmdline, detailed, interval);
 
-        char key = pollKey();                         // waits up to 1s
+        char key = pollKey(interval);                 // waits up to `interval`s
         if (key == 'q') {
             running = false;
         } else if (key == 'd') {
             detailed = !detailed;                     // toggle simple / detailed view
         } else if (key == 'a') {
             showCmdline = !showCmdline;               // toggle name / command line
+        } else if (key == 'c') {
+            mon.setSortMode(SortMode::CPU);           // sort process list by CPU
+        } else if (key == 'm') {
+            mon.setSortMode(SortMode::MEM);           // sort by memory
+        } else if (key == 'p') {
+            mon.setSortMode(SortMode::PID);           // sort by PID
+        } else if (key == '+' || key == '=') {
+            // Slower refresh (longer interval). '=' is the unshifted '+' key.
+            interval = std::min(MAX_INTERVAL, interval + 0.2);
+        } else if (key == '-' || key == '_') {
+            // Faster refresh (shorter interval).
+            interval = std::max(MIN_INTERVAL, interval - 0.2);
         } else if (key == '/') {
             // Prompt for a search filter. Drop to cooked mode so the user can
             // type and edit a full line comfortably; an empty line clears it.

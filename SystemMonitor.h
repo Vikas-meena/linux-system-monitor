@@ -32,6 +32,26 @@ struct DiskMount {
 };
 
 // ---------------------------------------------------------------------------
+// How the process table is ordered (Phase 1 sort toggle).
+// The user cycles this with the c / m / p keys.
+// ---------------------------------------------------------------------------
+enum class SortMode { CPU, MEM, PID };
+
+// ---------------------------------------------------------------------------
+// A tally of processes by kernel state (Phase 1 task summary).
+// Mirrors the R/S/D/Z/T life-cycle states so we can show a htop-style
+// "Tasks: N (r running, z zombie)" line.
+// ---------------------------------------------------------------------------
+struct TaskCounts {
+    int total    = 0;
+    int running  = 0;   // R
+    int sleeping = 0;   // S + I (idle kernel threads)
+    int stopped  = 0;   // T
+    int zombie   = 0;   // Z
+    int threads  = 0;   // sum of threads across all processes
+};
+
+// ---------------------------------------------------------------------------
 // SystemMonitor
 // ---------------------------------------------------------------------------
 // The "brain" of the program. It reads the /proc and /sys filesystems on every
@@ -63,6 +83,17 @@ public:
     int  getNumCores()    const { return numCores_; }
     const std::vector<double>& getCorePercents() const { return corePercents_; }
     const std::vector<Process>& getProcesses() const { return processes_; }
+
+    // --- Phase 1: uptime, load average, task/thread summary, sort mode ---
+    double getUptimeSec() const { return uptimeSec_; }
+    double getLoad1()  const { return load1_; }
+    double getLoad5()  const { return load5_; }
+    double getLoad15() const { return load15_; }
+    const TaskCounts& getTaskCounts() const { return taskCounts_; }
+
+    // The process list is sorted by whichever mode is set; the display cycles it.
+    void setSortMode(SortMode mode) { sortMode_ = mode; }
+    SortMode getSortMode() const { return sortMode_; }
 
     // Phase 2 getters.
     bool   hasCpuTemp()   const { return hasCpuTemp_; }
@@ -101,6 +132,8 @@ private:
     void readDiskStats();     // parse /proc/diskstats -> aggregate disk I/O rate
     void readDiskUsage();     // parse /proc/mounts + statvfs -> capacity per mount
     void readGpu();           // run nvidia-smi -> GPU load / memory / temperature
+    void readUptime();        // parse /proc/uptime  -> seconds since boot
+    void readLoadAvg();       // parse /proc/loadavg -> 1/5/15-min load averages
 
     // Elapsed wall-clock time between the last two update() calls. Rate metrics
     // (network, disk I/O) divide their byte/sector delta by this.
@@ -155,6 +188,12 @@ private:
 
     // --- Disk usage (Phase 2) ---
     std::vector<DiskMount> diskMounts_;
+
+    // --- Phase 1: uptime, load average, task/thread summary, sort mode ---
+    double     uptimeSec_ = 0.0;
+    double     load1_ = 0.0, load5_ = 0.0, load15_ = 0.0;
+    TaskCounts taskCounts_;
+    SortMode   sortMode_ = SortMode::CPU;
 };
 
 #endif // SYSTEM_MONITOR_H

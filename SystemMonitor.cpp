@@ -42,6 +42,8 @@ void SystemMonitor::update() {
 
     readMemInfo();
     readCpuStat();
+    readUptime();
+    readLoadAvg();
     readProcesses();
     readThermal();
     readNetDev();
@@ -151,6 +153,32 @@ void SystemMonitor::readCpuStat() {
     }
 }
 
+// ===========================================================================
+// readUptime(): how long the system has been running (Phase 1).
+// ---------------------------------------------------------------------------
+// /proc/uptime has two numbers: seconds since boot, and seconds all cores have
+// spent idle (summed). We only want the first.
+// ===========================================================================
+void SystemMonitor::readUptime() {
+    std::ifstream file("/proc/uptime");
+    if (!file.is_open()) return;
+    double up = 0.0;
+    if (file >> up) uptimeSec_ = up;
+}
+
+// ===========================================================================
+// readLoadAvg(): system load average (Phase 1).
+// ---------------------------------------------------------------------------
+// /proc/loadavg looks like:  0.52 0.58 0.59 1/1234 5678
+// The first three numbers are the 1-, 5- and 15-minute load averages — the
+// average number of processes that were runnable or in uninterruptible sleep.
+// ===========================================================================
+void SystemMonitor::readLoadAvg() {
+    std::ifstream file("/proc/loadavg");
+    if (!file.is_open()) return;
+    file >> load1_ >> load5_ >> load15_;
+}
+
 // Helper: is this /proc entry name a PID? (all-digit directory names)
 static bool isNumber(const std::string& s) {
     if (s.empty()) return false;
@@ -171,6 +199,7 @@ static bool isNumber(const std::string& s) {
 // ===========================================================================
 void SystemMonitor::readProcesses() {
     processes_.clear();
+    taskCounts_ = TaskCounts{};             // reset the per-state tally each refresh
 
     DIR* dir = opendir("/proc");
     if (!dir) return;
@@ -231,18 +260,28 @@ void SystemMonitor::readProcesses() {
             }
         }
 
-        // --- memory: VmRSS from /proc/<pid>/status ---
+        // --- memory + threads: from /proc/<pid>/status ---
+        // "VmRSS:" gives resident memory; "Threads:" gives this process's thread
+        // count. We read both in one pass over the file.
         {
             std::ifstream status("/proc/" + name + "/status");
             std::string line;
+            bool haveRss = false, haveThreads = false;
             while (std::getline(status, line)) {
-                if (line.rfind("VmRSS:", 0) == 0) {   // line starts with VmRSS:
+                if (!haveRss && line.rfind("VmRSS:", 0) == 0) {
                     std::istringstream ss(line);
                     std::string k, unit; long kb;
                     ss >> k >> kb >> unit;
                     p.memKB = kb;
-                    break;
+                    haveRss = true;
+                } else if (!haveThreads && line.rfind("Threads:", 0) == 0) {
+                    std::istringstream ss(line);
+                    std::string k; long n;
+                    ss >> k >> n;
+                    p.threads = n;
+                    haveThreads = true;
                 }
+                if (haveRss && haveThreads) break;
             }
         }
 
@@ -256,16 +295,33 @@ void SystemMonitor::readProcesses() {
                            static_cast<double>(procDelta) / totalJiffiesDelta_;
         }
 
+        // --- tally this process into the task-state summary ---
+        taskCounts_.total++;
+        taskCounts_.threads += static_cast<int>(p.threads);
+        switch (p.state) {
+            case 'R': taskCounts_.running++;  break;
+            case 'Z': taskCounts_.zombie++;   break;
+            case 'T':
+            case 't': taskCounts_.stopped++;  break;
+            default:  taskCounts_.sleeping++; break;   // S, D, I, ...
+        }
+
         processes_.push_back(std::move(p));
     }
     closedir(dir);
 
     prevProcTime_ = std::move(currentProcTime);   // remember for next refresh
 
-    // Sort by CPU usage (highest first), like `top`.
+    // Sort by whichever column the user chose (Phase 1 sort toggle). CPU and
+    // memory are "highest first"; PID is ascending, the natural spawn order.
     std::sort(processes_.begin(), processes_.end(),
-              [](const Process& a, const Process& b) {
-                  return a.cpuPercent > b.cpuPercent;
+              [this](const Process& a, const Process& b) {
+                  switch (sortMode_) {
+                      case SortMode::MEM: return a.memKB > b.memKB;
+                      case SortMode::PID: return a.pid < b.pid;
+                      case SortMode::CPU:
+                      default:            return a.cpuPercent > b.cpuPercent;
+                  }
               });
 }
 

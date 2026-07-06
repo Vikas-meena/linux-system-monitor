@@ -22,6 +22,7 @@ public:
     char state = '?';         // R=Running, S=Sleeping, D=Uninterruptible,
                               // Z=Zombie, T=Stopped   (process life-cycle)
     long nice = 0;            // Nice value (scheduling priority hint)
+    long threads = 1;         // Number of threads (from /proc/<pid>/status)
 
     // Raw CPU time this process has used, measured in "clock ticks" (jiffies).
     // utime = time spent in user mode, stime = time spent in kernel mode.
